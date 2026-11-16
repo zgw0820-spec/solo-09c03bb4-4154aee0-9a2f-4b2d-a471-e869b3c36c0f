@@ -17,7 +17,9 @@ services:
     ports:
       - "9002:8000"
 
-  gateway:
+  # 两个网关实例挂载同一数据卷（共享 SQLite），模拟滚动重启/并行部署：
+  # 在途记录按实例归属共同统计，任一实例异常退出后由存活实例按心跳租约回收。
+  gateway-1:
     build: ./gateway
     environment:
       # 已登记的上游清单；启动时写入 SQLite，重启后按已登记路由接流量
@@ -26,6 +28,20 @@ services:
       GATEWAY_DB: /data/gateway.db
     ports:
       - "8080:8000"
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      - upstream-a
+      - upstream-b
+
+  gateway-2:
+    build: ./gateway
+    environment:
+      UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
+      INITIAL_TARGET: alpha
+      GATEWAY_DB: /data/gateway.db
+    ports:
+      - "8081:8000"
     volumes:
       - gateway-data:/data
     depends_on:

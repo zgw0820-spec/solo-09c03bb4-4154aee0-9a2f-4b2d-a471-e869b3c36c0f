@@ -2,10 +2,13 @@
 """End-to-end smoke test for the edge gateway.
 
 Usage:
-  smoke_test.py BASE_URL SAVE_FILE phase1   # switch semantics, arms an interrupted request
-  smoke_test.py BASE_URL SAVE_FILE phase2   # post-restart recovery checks
+  smoke_test.py BASE_URL SAVE_FILE phase1            # switch semantics, arms an interrupted request
+  smoke_test.py BASE_URL SAVE_FILE phase2            # post kill -9 recovery (lease-based reclaim)
+  smoke_test.py BASE_URL SAVE_FILE phase3a           # rolling restart: arm a slow request on instance 1
+  smoke_test.py BASE_URL SAVE_FILE phase3b PEER_URL  # rolling restart: shared drain view + reclaim
 """
 import json
+import os
 import sys
 import threading
 import time
@@ -15,14 +18,15 @@ import urllib.request
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SAVE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/edge-gw-phase1.json"
 PHASE = sys.argv[3] if len(sys.argv) > 3 else "phase1"
+PEER = sys.argv[4] if len(sys.argv) > 4 else None
 
 FAILURES: list[str] = []
 
 
-def api(method, path, body=None, timeout=70):
+def api(method, path, body=None, timeout=70, base=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        BASE + path, method=method, data=data,
+        (base or BASE) + path, method=method, data=data,
         headers={"content-type": "application/json"},
     )
     try:
@@ -61,6 +65,16 @@ def wait_state(pred, what, timeout=10):
     return api("GET", "/api/state")[1]
 
 
+def slow_call(delay_ms, base=None, sink=None):
+    try:
+        s, b = api("POST", "/api/call", {"delay_ms": delay_ms}, base=base)
+        if sink is not None:
+            sink["status"], sink["body"] = s, b
+    except Exception as e:  # noqa: BLE001 - connection reset when a gateway dies
+        if sink is not None:
+            sink["error"] = str(e)
+
+
 def phase1():
     _, st = api("GET", "/api/state")
     check("初始当前目标为 alpha", st["route"]["current_target"] == "alpha")
@@ -69,15 +83,7 @@ def phase1():
 
     # 1) slow request admitted to alpha, keeps running through the switch
     slow = {}
-
-    def slow_call():
-        try:
-            s, b = api("POST", "/api/call", {"delay_ms": 4000})
-            slow["status"], slow["body"] = s, b
-        except Exception as e:  # noqa: BLE001
-            slow["error"] = str(e)
-
-    t = threading.Thread(target=slow_call, daemon=True)
+    t = threading.Thread(target=slow_call, args=(4000,), kwargs={"sink": slow}, daemon=True)
     t.start()
     wait_state(lambda s: inflight_of(s, "alpha") == 1, "alpha 在途变为 1")
 
@@ -165,13 +171,7 @@ def phase1():
     check("当前目标 beta 不标记可下线", upstream_of(st, "beta")["can_offline"] is False)
 
     # 12) arm one in-flight request that the harness will interrupt with kill -9
-    def interrupted():
-        try:
-            api("POST", "/api/call", {"delay_ms": 15000})
-        except Exception:  # noqa: BLE001 - connection reset when gateway dies
-            pass
-
-    threading.Thread(target=interrupted, daemon=True).start()
+    threading.Thread(target=slow_call, args=(15000,), daemon=True).start()
     wait_state(lambda s: inflight_of(s, "beta") == 1, "重启前 beta 在途为 1")
     with open(SAVE, "w") as f:
         json.dump({"target": "beta", "version": 3}, f)
@@ -195,17 +195,133 @@ def phase2():
     _, st = api("GET", "/api/state")
     check("重启后按已登记路由接流量(目标不变)", st["route"]["current_target"] == saved["target"])
     check("重启后路由版号保持", st["route"]["version"] == saved["version"])
+    # The killed instance's heartbeat lease expires shortly after death; the
+    # new instance's reaper (which also runs once at boot) then reclaims its
+    # interrupted row. Wait for that instead of assuming a boot-time wipe.
+    st = wait_state(lambda s: len(s["inflight"]) == 0, "中断请求被租约回收", timeout=15)
     check("中断请求未留作在途", len(st["inflight"]) == 0)
-    check("启动时清理了中断在途记录", st["boot"]["cleared_inflight"] >= 1)
+    check("回收已被记录(启动时或租约到期后)", st["reclaimed_inflight"] >= 1)
+    check("被杀实例已从注册表清除",
+          all(i["alive"] for i in st["instances"]) and len(st["instances"]) == 1)
     s, r = api("POST", "/api/call", {"delay_ms": 50})
     check("重启后新请求正常发往已登记目标",
           r["target"] == saved["target"] and r["ok"] is True)
 
 
+def phase3a():
+    """Rolling-restart drill, part 1: route to alpha on instance 1 and arm a
+    slow request there, so instance 2 boots while a peer's request is in
+    flight."""
+    _, st = api("GET", "/api/state")
+    ver = st["route"]["version"]
+    if st["route"]["current_target"] != "alpha":
+        s, p = api("POST", "/api/switch/probe", {"target": "alpha", "base_version": ver})
+        check("phase3: 探测 alpha 成功", p["ok"] is True)
+        s, c = api("POST", "/api/switch/commit",
+                   {"target": "alpha", "base_version": ver, "probe_id": p["probe_id"]})
+        check("phase3: 路由切回 alpha", c.get("ok") is True and c.get("version") == ver + 1)
+        ver = c["version"]
+
+    threading.Thread(target=slow_call, args=(10000,), daemon=True).start()
+    wait_state(lambda s: inflight_of(s, "alpha") == 1, "实例1 alpha 在途为 1")
+    _, st = api("GET", "/api/state")
+    saved = {}
+    if os.path.exists(SAVE):
+        with open(SAVE) as f:
+            saved = json.load(f)
+    saved.update({
+        "target": "alpha",
+        "version": ver,
+        "gw1_instance": st["boot"]["instance_id"],
+    })
+    with open(SAVE, "w") as f:
+        json.dump(saved, f)
+    with open(SAVE + ".ready3a", "w") as f:
+        f.write("1")
+    print("PHASE3A READY: 实例1 上 alpha 慢请求在途，等待第二个实例启动")
+
+
+def phase3b():
+    """Rolling-restart drill, part 2: this instance (gw2) booted while gw1's
+    slow request was in flight. The shared drain view must still show it."""
+    with open(SAVE) as f:
+        saved = json.load(f)
+    gw1 = saved["gw1_instance"]
+    _, st = api("GET", "/api/state")
+    gw2 = st["boot"]["instance_id"]
+    check("第二实例启动未清空共享在途(alpha 仍 1)", inflight_of(st, "alpha") == 1)
+    check("在途行仍归属第一实例", any(x.get("instance_id") == gw1 for x in st["inflight"]))
+    alive = [i for i in st["instances"] if i["alive"]]
+    check("两个实例均存活、共同统计", len(alive) == 2, str(st["instances"]))
+
+    # switch alpha -> beta from the second instance
+    ver = st["route"]["version"]
+    s, p = api("POST", "/api/switch/probe", {"target": "beta", "base_version": ver})
+    check("phase3: 探测 beta 成功", p["ok"] is True)
+    s, c = api("POST", "/api/switch/commit",
+               {"target": "beta", "base_version": ver, "probe_id": p["probe_id"]})
+    check("phase3: 切换到 beta", c.get("ok") is True and c.get("version") == ver + 1)
+    s, r = api("POST", "/api/call", {"delay_ms": 50})
+    check("切换后新请求立即走 beta", r["target"] == "beta")
+    _, st = api("GET", "/api/state")
+    check("旧目标 alpha 仍有 1 条在途", inflight_of(st, "alpha") == 1)
+    check("旧请求完整返回前不提示下线", upstream_of(st, "alpha")["can_offline"] is False)
+
+    # gw1's slow request finishes -> alpha drains -> only then offlinable
+    st = wait_state(lambda s: inflight_of(s, "alpha") == 0, "alpha 在途清零", timeout=20)
+    check("排空完成后提示可下线", upstream_of(st, "alpha")["can_offline"] is True)
+
+    # interruption drill: one in-flight request on each instance, then the
+    # harness kills gw1 with -9; only gw1's row may be reclaimed
+    threading.Thread(target=slow_call, args=(10000,), kwargs={"base": PEER}, daemon=True).start()
+    threading.Thread(target=slow_call, args=(10000,), daemon=True).start()
+    wait_state(lambda s: inflight_of(s, "beta") == 2, "两实例各挂一条在途")
+    _, st = api("GET", "/api/state")
+    owners = {x.get("instance_id") for x in st["inflight"]}
+    check("两条在途分属两个实例", gw1 in owners and gw2 in owners, str(owners))
+    with open(SAVE + ".ready3b", "w") as f:
+        f.write("1")
+    print("PHASE3B READY: 等待实例1 被杀")
+
+    deadline = time.time() + 60
+    dead = False
+    while time.time() < deadline:
+        try:
+            api("GET", "/api/health", timeout=1, base=PEER)
+            time.sleep(0.2)
+        except Exception:  # noqa: BLE001
+            dead = True
+            break
+    check("第一实例已被杀", dead)
+
+    # after the lease expires, gw1's interrupted row is reclaimed while
+    # gw2's own in-flight request survives untouched
+    st = wait_state(
+        lambda s: len(s["inflight"]) == 1
+        and all(x.get("instance_id") == gw2 for x in s["inflight"]),
+        "gw1 中断请求被回收且 gw2 请求保留", timeout=20)
+    check("仅回收异常退出实例的中断请求",
+          len(st["inflight"]) == 1 and st["inflight"][0].get("instance_id") == gw2)
+    check("存活实例的请求未被清理", any(x.get("instance_id") == gw2 for x in st["inflight"]))
+    check("回收计数已记录", st["reclaimed_inflight"] >= 1)
+    check("失联实例已从注册表清除", all(i["id"] != gw1 for i in st["instances"]))
+    check("路由保持 beta、版号未变",
+          st["route"]["current_target"] == "beta" and st["route"]["version"] == ver + 1)
+
+    wait_state(lambda s: len(s["inflight"]) == 0, "gw2 在途清零", timeout=20)
+
+
 if PHASE == "phase1":
     phase1()
-else:
+elif PHASE == "phase2":
     phase2()
+elif PHASE == "phase3a":
+    phase3a()
+elif PHASE == "phase3b":
+    assert PEER, "phase3b 需要 PEER_URL 参数"
+    phase3b()
+else:
+    raise SystemExit(f"unknown phase: {PHASE}")
 
 if FAILURES:
     print(f"\n{len(FAILURES)} 项检查失败:")

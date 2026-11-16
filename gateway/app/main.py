@@ -39,8 +39,14 @@ INITIAL_TARGET = os.environ.get("INITIAL_TARGET") or next(iter(UPSTREAMS))
 async def lifespan(app: FastAPI):
     app.state.boot_info = db.init_db(UPSTREAMS, INITIAL_TARGET)
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=3.0))
-    yield
-    await app.state.http.aclose()
+    try:
+        yield
+    finally:
+        # Graceful exit: drop our own in-flight rows and deregister so peers
+        # stop counting us immediately. A kill -9 skips this; the survivors'
+        # reaper then reclaims our interrupted rows once the lease expires.
+        db.shutdown()
+        await app.state.http.aclose()
 
 
 app = FastAPI(title="edge-gateway", lifespan=lifespan)
